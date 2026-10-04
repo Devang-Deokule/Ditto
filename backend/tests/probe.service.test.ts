@@ -1,5 +1,6 @@
 import { readFile } from 'node:fs/promises';
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+import logger from '../src/Config/logger.js'
 
 import ProbeService, {
   buildRows,
@@ -97,17 +98,20 @@ describe('ProbeService.probe — real execution', () => {
     expect(table).toBeUndefined();
   });
 
-  it('NEVER executes pure Python members (honesty rail — issue #27)', async () => {
+  it('executes pure Python members in the Pyodide sandbox', async () => {
     const table = await new ProbeService().probe(
       [
-        { id: 'py-add', body: 'function py_add(a, b) { return a + b; }', isPure: true, language: 'python' },
-        { id: 'py-sum', body: 'function py_sum(a, b) { return a + b; }', isPure: true, language: 'python' },
+        { id: 'py-add', body: 'def py_add(a, b):\n    return a + b', isPure: true, language: 'python' },
+        { id: 'py-sum', body: 'def py_sum(a, b):\n    return b + a', isPure: true, language: 'python' },
       ],
       ['[1, 2]']
     );
-
-    expect(table).toBeUndefined();
-  });
+  
+    expect(table).toBeDefined();
+    expect(table?.executed).toBe(true);
+    expect(table?.rows).toHaveLength(1);
+    expect(table?.rows[0].diverged).toBe(false);
+  }, 15000);
 
 
   it('will not run a cluster with only one pure member', async () => {
@@ -282,6 +286,50 @@ describe('ProbeService.probe — real execution', () => {
     expect(outputs).toContain('null');
     expect(table!.rows[0].diverged).toBe(true);
   });
+  
+  it('probes majority language and reports dropped members in a mixed cluster (2 Python + 2 TS)', async () => {
+    const warnSpy = vi.spyOn(logger, 'warn');
+
+    const table = await new ProbeService().probe(
+      [
+        { id: 'ts-1', body: 'function a(x) { return x + 1; }', isPure: true, language: 'ts' },
+        { id: 'ts-2', body: 'function b(x) { return x + 1; }', isPure: true, language: 'ts' },
+        { id: 'py-1', body: 'def py1(x):\n    return x + 1', isPure: true, language: 'python' },
+        { id: 'py-2', body: 'def py2(x):\n    return x + 1', isPure: true, language: 'python' },
+      ],
+      ['[5]']
+    );
+
+    expect(table).toBeDefined();
+    expect(table!.executed).toBe(true);
+
+    // TypeScript is chosen on tie (2 vs 2): only TS members are in the output table
+    const executedIds = table!.rows[0].results.map((r) => r.functionId);
+    expect(executedIds.sort()).toEqual(['ts-1', 'ts-2']);
+
+    // Assert that the dropped Python members are reported as unusable rather than silently dropped
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('probe could not materialise py-1: skipped: cluster probed as typescript')
+    );
+    expect(warnSpy).toHaveBeenCalledWith(
+      expect.stringContaining('probe could not materialise py-2: skipped: cluster probed as typescript')
+    );
+
+    warnSpy.mockRestore();
+  });
+
+  it('does not produce a false agreement row when members return unserializable values', async () => {
+    const table = await new ProbeService().probe(
+      [
+        { id: 'fn-a', body: 'class A:\n    pass\ndef f():\n    return A()', isPure: true, language: 'python' },
+        { id: 'fn-b', body: 'class B:\n    pass\ndef f():\n    return B()', isPure: true, language: 'python' },
+      ],
+      ['[]']
+    );
+    // Both are marked unusable, so fewer than 2 members survive -> no table returned
+    expect(table).toBeUndefined();
+  });
+
 });
 
 describe('buildRows', () => {
